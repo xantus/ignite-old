@@ -1,0 +1,51 @@
+#!/usr/bin/perl
+
+use File::Basename 'dirname';
+use File::Spec;
+
+my $bin;
+BEGIN {
+    $bin = join( '/', File::Spec->splitdir(dirname(__FILE__)) );
+}
+
+use lib "$bin/lib"
+use lib "$bin/../lib";
+
+use Mojolicious::Lite;
+use Ignite::Lite;
+
+app->log->level( 'debug' );
+
+@ARGV = qw( daemon ) unless @ARGV;
+
+my $buffer = [];
+
+socketio 'open' => sub {
+    my ( $client ) = @_;
+
+    $client->send_message({ sessionid => $client->id });
+    $client->send_message({ buffer => $buffer });
+
+    $client->broadcast({ announcement => $client->id . ' connected' });
+
+    $client->heartbeat( 10 );
+};
+
+socketio 'close' => sub {
+    my ( $client ) = @_;
+
+    $client->broadcast({ announcement => $client->id . ' disconnected' });
+    $client->disconnect();
+};
+
+socketio 'message' => sub {
+    my ( $client, $data ) = @_;
+
+    my $msg = { message => [ $client->id, $data ] };
+    push( @$buffer, $msg );
+    shift @$buffer if ( $#{$buffer} > 15 );
+
+    $client->broadcast($msg);
+};
+
+app->start;
