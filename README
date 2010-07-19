@@ -1,4 +1,11 @@
 
-Socket.IO for Mojolicious (http://mojolicio.us/)
+Socket.IO for Perl
 
+Requirements: Mojolicious (http://mojolicio.us/)
 License: MIT (Same as Socket.IO)
+
+------------------------------------------------
+
+Currently only WebSockets work.
+
+The other transports are in the works
