@@ -1,11 +1,13 @@
+Ignite, the scalable Perl Socket.IO server
 
-Socket.IO for Perl
+Requirements:
+    Mojolicious (http://mojolicio.us/) (get the git version)
+    CouchDB (http://couch.io/) (v1.0.0+)
 
-Requirements: Mojolicious (http://mojolicio.us/)
-License: MIT (Same as Socket.IO)
+License: MIT
 
 ------------------------------------------------
 
-Currently only WebSockets work.
+Currently in heavy development, don't expect it to work yet.
 
 The other transports are in the works
