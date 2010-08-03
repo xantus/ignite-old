@@ -12,7 +12,7 @@
     
       function message(obj){
         var el = document.createElement('p');
-        if ('announcement' in obj) el.innerHTML = '<em>' + obj.announcement; 
+        if ('announcement' in obj) el.innerHTML = '<em>' + obj.announcement + '</em>'; 
         else if ('message' in obj) el.innerHTML = '<b>' + obj.message[0] + ':</b> ' + obj.message[1];
         document.getElementById('chat').appendChild(el);
         document.getElementById('chat').scrollTop = 1000000;
@@ -26,14 +26,19 @@
       }
     
       var socket = new io.Socket(null, {rememberTransport: false, port: 3000});
+      socket.addEvent('connect', function() {
+        document.getElementById('form').style.display='block';
+        document.getElementById('chat').innerHTML = '';
+        message({announcement:'You have connected'});
+      });
+      socket.addEvent('disconnect', function() {
+        message({announcement:'You have been disconnected'});
+      });
       socket.connect();
       socket.addEvent('message', function(data){
         var obj = JSON.parse(data);
 
         if ('buffer' in obj){
-          document.getElementById('form').style.display='block';
-          document.getElementById('chat').innerHTML = '';
-          
           for (var i in obj.buffer) message(obj.buffer[i]);
         } else message(obj);
       });      
