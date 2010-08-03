@@ -1,0 +1,30 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use File::Basename 'dirname';
+use File::Spec;
+
+my $bin;
+BEGIN {
+    $bin = join( '/', File::Spec->splitdir(dirname(__FILE__)) );
+}
+
+use lib "$bin/lib";
+use lib "$bin/../lib";
+
+$ENV{MOJO_HOME} = "$bin/../";
+
+use Mojolicious;
+
+unless ( @ARGV ) {
+    print "This is Mojo/$Mojo::VERSION\n";
+    @ARGV = qw( daemon --listen http://*:3000 );
+#    push( @ARGV, "--lock=$bin/var/ignite.lock" );
+    push( @ARGV, "--pid=$bin/var/ignite.pid" );
+}
+
+use Ignite::App;
+
+Ignite::App->start;
