@@ -6,29 +6,47 @@ use warnings;
 use base 'Mojolicious::Plugin';
 
 use Ignite::Plugins;
-use JSON;
+use MojoX::CouchDB;
+use Digest::SHA1 qw( sha1_hex );
+use Ignite::Clients;
+
+use MojoX::JSON;
 
 our $VERSION = '1.00';
+my $loop;
+my $clients;
 
 BEGIN {
-    # install JSON and JSON::XS if you can!
-    eval 'use JSON();';
-    eval ( $@ ? 'sub HAS_JSON(){ 0 }' : 'sub HAS_JSON(){ 1 }' );
+    $loop = Mojo::IOLoop->singleton;
+    $clients = Ignite::Clients->singleton;
 };
 
-__PACKAGE__->attr( plugins => sub { Ignite::Plugins->new });
+__PACKAGE__->attr([qw/ db cfg db_name /]);
+__PACKAGE__->attr( _json => sub { MojoX::JSON->singleton } );
+__PACKAGE__->attr( plugins => sub { Ignite::Plugins->new } );
+__PACKAGE__->attr( couch => sub { MojoX::CouchDB->new } );
+# can't do this because it uses $json->error
+#__PACKAGE__->attr( couch => sub {
+#    my $c = MojoX::CouchDB->new;
+#    $c->_json_encoder( MojoX::JSON->singleton );
+#    $c->_json_decoder( MojoX::JSON->singleton );
+#    return $c;
+#});
 
 sub register {
-    my ($plugin, $app, $cfg) = @_;
+    my ($self, $app, $cfg_url) = @_;
 
-    $cfg ||= {};
+    return $self if ( $self->{configured}++ ); # hmm
 
-    @{$plugin}{ keys %$cfg } = values %$cfg;
+    $self->_config( $app, $cfg_url ) if defined $cfg_url;
 
-    my $base = $self->{base} ? $self->{base} : '/socket.io';
+    die __PACKAGE__." - You must configure ignite with a couchdb url" unless $self->cfg;
+
+#    require Data::Dumper;
+#    warn Data::Dumper->Dump([$self->cfg]);
 
     # use the faster JSON module if available
-    if ( HAS_JSON ) {
+    if ( MojoX::JSON::HAS_JSON ) {
         $app->plugins->add_hook(
             after_build_tx => sub {
                 my $tx = $_[1];
@@ -38,89 +56,208 @@ sub register {
         );
     }
 
-    $app->routes->route( $base.'/websocket' )->websocket->to({ cb => sub { $plugin->_websocket( @_ ); } });
-    $app->routes->route( $base )->to({ cb => sub { $plugin->_dispatch( @_ ); } });
+    my $base = $self->cfg->field( 'base' ) || '/socket.io';
 
-    return $plugin;
+    # XXX detour?
+    $app->routes->route( $base.'/websocket' )->websocket->to({ cb => sub { $self->_handle_websocket( @_ ); } });
+    $app->routes->route( $base.'/xhr-polling/:r' )->to({ cb => sub { $self->_handle_xhr_polling( @_ ); } });
+#    $app->routes->route( $base )->to({ cb => sub { $self->_dispatch( @_ ); } });
+
+    $self->cfg->field( seq => 0 ) unless defined $self->cfg->field( 'seq' );
+    $self->cfg->field( heartbeat => 5000 ) unless $self->cfg->field( 'heartbeat' );
+
+    # XXX I don't like this
+#    $clients->couch_url( $self->{couch_url} );
+#    $clients->cfg( $self->cfg );
+
+    warn "db is ".$self->db." client is ".$clients;
+    $clients->db( $self->db );
+
+    $loop->timer( 1 => sub { $self->watch_couchdb($app); } );
+
+    return $self;
 }
 
-sub _websocket {
-    my ( $plugin, $self ) = @_;
+sub _config {
+    my ( $self, $app, $cfg ) = @_;
 
-#    return unless ( $self->tx->is_websocket );
+    if ( ref $cfg eq 'HASH' && $cfg->{config} ) {
+        $cfg = $cfg->{config};
+    }
+
+    if ( ref $cfg eq 'ARRAY' ) {
+        $self->_check_install( $cfg );
+    } elsif ( $cfg =~ m/^http/i ) {
+        $self->_check_install( [ $cfg ] );
+#    } elsif ( ref $cfg eq 'HASH' ) {
+#        # XXX remove this?
+#        # merge config
+#        my $doc = $self->cfg;
+#        my $data = { map { ( $_ => $doc->field($_) ) } @{$doc->fields->names} };
+#        @{$data}{ keys %$cfg } = values %$cfg;
+#        $cfg = $data;
+#
+#        if ( my $mojo = $cfg->{mojo_config} ) {
+#            @{$app}{keys %$mojo} = values %$mojo;
+#        }
+#        if ( $cfg->{config} ) {
+#            $self->_check_install( ref $cfg->{config} ? $cfg->{config} : [ $cfg->{config} => 'config' ] );
+#        } else {
+#            die __PACKAGE__." - You must specify a config key with a couchdb url\n";
+#        }
+    } else {
+        die __PACKAGE__." - Illegal config ".Data::Dumper->Dump([$cfg]);
+    }
+
+    return $self->cfg;
+}
+
+sub _check_install {
+    my ( $self, $args ) = @_;
+
+    my ( $couchurl, $id ) = @$args;
+
+    my $url = $self->{couch_url} = Mojo::URL->new( $couchurl );
+
+    $self->couch->address( $url->host || '127.0.0.1' );
+    $self->couch->port( $url->port || 5984 );
+
+    my $db_name = $url->path->parts->[0];
+    my $config_key = $id || $url->path->parts->[1] || 'config';
+
+    my $db = $self->couch->new_database( $db_name );
+
+    my $doc = $db->get_document( $config_key );
+
+    my @dbs = $self->couch->all_databases;
+
+    #if ( $doc->error ) {
+    if ( $doc->isa( 'MojoX::CouchDB::Error' ) ) {
+        my @exists = grep { warn $_->name; $_->name eq $db_name } @dbs;
+        $db->create unless @exists;
+        $doc = $db->create_document( $config_key,
+            base => '/socket.io',
+            mojo_config => {
+                # use a uuid as a secret
+#               secret => $db->raw_get( '/_uuids' )->field( 'uuids' )->[0]
+               secret => sha1_hex( time().'|'.rand(100000) )
+            }
+        );
+    }
+
+    $db_name = $doc->field( 'db' ) || $db_name;
+    $self->db_name( $db_name );
+
+    $self->db( $self->couch->new_database( $db_name ) );
+
+    $self->cfg( $doc );
+
+    foreach ( @dbs ) {
+        if ( $_->name =~ m/^ignite_cli_(.*)/ ) {
+            warn "found client db: $1\n";
+
+        }
+    }
+}
+
+sub _handle_websocket {
+    my ( $self, $c ) = @_;
+
+    return unless ( $c->tx->is_websocket );
 
     warn "websocket @_\n";
 
-    my $client = SocketIOClient->new( $self );
+    my $client = $clients->fetch_create( $c, $c->session( 'cid' ) );
 
-    $self->finished(sub {
-        $plugin->plugins->run_hook( 'close', $client );
+    $c->finished(sub {
+        $self->plugins->run_hook( 'close', $client );
     });
 
-    $self->receive_message(sub {
-        $plugin->plugins->run_hook( 'message', $client, ( decode_json( $_[1] ) )->[0] );
+    $c->receive_message(sub {
+        $self->plugins->run_hook( 'message', $client, ( $self->_json->decode( $_[1] ) )->[0] );
     });
 
-    $plugin->plugins->run_hook( 'open', $client );
+    $self->plugins->run_hook( 'open', $client );
 
     return
 }
 
 sub _dispatch {
-    my ( $plugin, $self ) = @_;
+    my ( $self, $c ) = @_;
 
     warn "dispatch\n";
-    my $method = $self->req->method;
 
-    my $client = SocketIOClient->new( $self ); # XXX fetch existing based on cookie
+    $c->render_json({});
+}
 
-    if ( $method eq 'GET' ) {
-        if ( $plugin->_origin_ok( $self ) ) {
-            $self->res->headers->header( 'Access-Control-Allow-Origin' => $self->req->headers->header( 'Origin' );
-            if ( $self->req->headers->header('Cookie') ) {
-                $self->res->headers->header( 'Access-Control-Allow-Credentials' => 'true' );
-            }
-        }
+sub _setup_session {
+    my ( $self, $c ) = @_;
 
-        # XXX move all this into client
-        if ( $client->{_buffer} ) {
-            $self->render_json({ messages => $self->{_buffer} });
+    my $cid = $c->session( 'cid' );
+
+    # session creation
+    unless ( $cid ) {
+        if ( $c->param( 'cookietest' ) ) {
+            $c->render_text( 'Cookies must be turned on' );
             return;
         }
-
-        # no msgs waiting, wait 15s
-        $self->tx->pause;
-
-        $self->{_timer} = $loop->timer( 15 => $client->{_resume} = sub {
-            $loop->drop( $self->{_timer} );
-            $self->tx->resume;
-            $self->render_json({ messages => $self->{_buffer} || [] });
-        });
-
-        return;
-    } elsif ( $method eq 'POST' ) {
-        if ( my $data = $self->req->param( 'data' ) {
-            $data = json_decode( $data );
-            if ( $data->{messages} ) {
-                foreach ( @{$data->{messages}} ) {
-                    $plugin->plugins->run_hook( 'message', $client, $_ );
-                }
-            }
-        }
-        $self->render_text('ok');
+        $cid = sha1_hex( time() + rand(100000) );
+        $c->session( cid => $cid );
+        warn "created session $cid\n";
+        my $base = $c->cfg->field('base') || '/socket.io';
+        $c->redirect_to( $base.'/xhr-polling'.time().'?cookietest=1' );
         return;
     }
 
-    $self->render_json({});
+    return $cid;
+}
+
+sub _handle_xhr_polling {
+    my ( $self, $c ) = @_;
+
+    # XXX config deny xdomain?
+    if ( $self->_origin_ok( $c ) ) {
+        $c->res->headers->header( 'Access-Control-Allow-Origin' => $c->req->headers->header( 'Origin' ) );
+        if ( $c->req->headers->header('Cookie') ) {
+            $c->res->headers->header( 'Access-Control-Allow-Credentials' => 'true' );
+        }
+    }
+
+    my $cid = $self->_setup_session( $c );
+    return unless $cid;
+
+    my $client = $clients->fetch_create( $c, $cid );
+
+    warn "xhr-poll\n";
+    my $method = $c->req->method;
+
+    if ( $method eq 'GET' ) {
+        # get data if available, or wait 15s if none waiting
+        $client->recv_or_wait( 15 );
+        return;
+    } elsif ( $method eq 'POST' ) {
+        if ( my $data = $c->req->param( 'data' ) ) {
+            $data = $self->_json->decode( $data );
+            if ( $data->{messages} ) {
+                foreach ( @{$data->{messages}} ) {
+                    $self->plugins->run_hook( 'message', $client, $_ );
+                }
+            }
+        }
+        $c->render_text('ok');
+        return;
+    }
+
+    $c->render_json({});
 }
 
 sub _origin_ok {
-    my ( $plugin, $self ) = @_;
+    my ( $self, $c ) = @_;
 
-    return 0 unless $self->req->headers->header( 'Origin' );
+    return 0 unless $c->req->headers->header( 'Origin' );
 
-    my $origin = Mojo::URL->new($self->req->headers->header( 'Origin' ));
-    my $allow = $plugin->{origins} || {};
+    my $origin = Mojo::URL->new( $c->req->headers->header( 'Origin' ) );
+    my $allow = $self->cfg->field( 'origins' ) || {};
 
     my $host = $origin->host;
     my $port = $origin->port || 80;
@@ -133,108 +270,134 @@ sub _origin_ok {
     return 0;
 }
 
-sub _handle {
-    shift->plugins->add_hook( @_ );
-}
+sub watch_couchdb {
+    my ( $self, $app ) = @_;
 
-1;
+    my $json = $self->_json;
 
-package SocketIOClient;
+    warn "do request\n";
 
-use JSON;
+    my $url = $self->{couch_url}->clone;
 
-use Time::HiRes;
-use Digest::SHA1;
+    my $db_name = $self->db_name;
 
-use strict;
-use warnings;
+    $url->path( '/'.$db_name.'/_changes' );
 
-my $loop,
-
-my $clients;
-BEGIN {
-    $clients = {};
-    $loop = Mojo::IOLoop->singleton;
-}
-
-sub new {
-    my $class = shift;
-
-    my $self = bless( {
-        _id => Digest::SHA1::sha1_hex( time() + rand(100000) ),
-        client => shift
-    }, ref $class || $class );
-
-    warn "new client $self with $self->{client}\n";
-    $SocketIOClient::clients->{ $self->id } = $self;
-
-    return $self;
-}
-
-sub id {
-    shift->{_id};
-}
-
-sub broadcast {
-    my ( $self, $msg ) = @_;
-
-    # auto encode messages if they're not a string
-    if ( ref $_[0] ) {
-        $msg = encode_json( $msg );
+    my $seq = $self->cfg->field( 'seq' );
+    if ( $seq > 0 ) {
+        $url->query->param( since => $seq );
     }
+    $url->query->param( heartbeat => $self->cfg->field( 'heartbeat' ) || 5000 );
+    $url->query->param( style => 'all_docs' );
+    $url->query->param( include_docs => 'true' );
+    $url->query->param( feed => 'continuous' );
 
-    $msg = encode_json({ messages => [ $msg ] });
+    warn "requesting $url\n";
+    my $tx = $app->client->async->build_tx( GET => $url );
+    my $error;
 
-    foreach ( values %{$SocketIOClient::clients} ) {
-        next if $_ eq $self;
-        warn "sending message $msg to $_\n";
-        $_->{client}->send_message( $msg );
-    }
-}
+    $tx->res->body(sub {
+        my $chunk = $_[1];
 
-sub send_message {
-    my ( $self, $msg ) = @_;
+# debugging
+#        my $c = "$chunk";
+#        $c =~ s/\x0D/\\n/g; $c =~ s/\x0A/\\r/g;
+#        warn "chunk [$c]\n";
 
-    if ( ref $msg ) {
-        $msg = encode_json( $msg );
-    }
+        # heartbeat
+        return if ( $chunk eq "\x0A" );
 
-    $self->{client}->send_message( encode_json({ messages => [ $msg ] }) );
+        foreach ( split( /\x0A/, $chunk ) ) {
+            my $obj;
+            eval {
+                $obj = $json->decode( $_ );
+                warn Data::Dumper->Dump([$obj]);
+                if ( defined $obj->{seq} && $seq > $obj->{seq} ) {
+                    $seq = $obj->{seq};
+                    $self->cfg->field( seq => $seq );
+                    # XXX terrible
+                    $self->cfg->save;
+                }
+                #$VAR1 = {
+                #  'changes' => [
+                #                 {
+                #                   'rev' => '2-e081699c08a8eb52bd8c8eb73feabbf3'
+                #                 }
+                #               ],
+                #  'id' => '36c72dd8895a11df8cadb613e6644a9f',
+                #  'seq' => 13
+                #};
+                # do something with data: $obj
 
-    return;
-}
+                return unless ( $obj->{id} );
+                # we only care about clients actively connected: websockets or waiting longpolls, etc
+#                return unless ( $clients->fetch( $obj->{id} ) );
 
-sub disconnect {
-    my $self = shift;
+                # check the db for this client
+#                warn "there is a waiting client: $obj->{id}\n";
 
-    Mojo::IOLoop->singleton->drop( $self->{client}->tx );
+                my $nurl = $url->clone;
+                $nurl->path( '/'.$db_name.'/'.$obj->{id} );
 
-    $loop->drop( $self->{_timerid} ) if $self->{_timerid};
+                $app->client->get($nurl => sub {
+                    my $doc = $_[1]->res->json;
+                    warn Data::Dumper->Dump([$doc],['doc']);
+                    # XXX
+                    return;
+                    # XXX
+                    if ( $doc->{_id} ) {
+#                        if ( my $cli = $clients->fetch( $obj->{id} ) ) {
+#                            my $input = delete $check->{input};
+#                            $check->{input} = [];
+#                            $app->client->put($nurl => $json->encode($check) => sub {
+#                                my $tx = $_[1];
+#                                warn Data::Dumper->Dump([$tx->res->json]);
+#                                # todo, failure
+#                            })->process;
+#
+#                            # client exists
+#                            warn "client exists in db too\n";
+#                            $cli->send_message($input);
+#                        }
+                        if ( $doc->{channel} ) {
+                            if ( $doc->{channel} =~ m!^/cid/(.+)! ) {
+                                warn "looking for client $1\n";
+                                if ( my $cli = $clients->fetch( $1 ) ) {
+                                    warn "found, sending message\n";
+                                    $cli->send_message( $doc->{event}, 1, 1 );
+                                }
+                            } elsif ( $doc->{channel} eq '/all' ) {
+                                warn "sending to all\n";
+                                $clients->_send_all( ( ref $doc->{event} ? $json->_json->encode( $doc->{event} ) : $doc->{event} ), $doc->{from} );
+                            }
+                        }
+                    }
+                })->process;
+            };
+            if ( $@ ) {
+                warn "Error parsing |$_|  Error Msg: $@\n";
+            }
+            if ( $obj->{error} ) {
+                $error = $obj;
+            } else {
+                $error = undef;
+            }
+        }
+    });
 
-    delete $SocketIOClient::clients->{ $self->id };
+    $app->client->keep_alive_timeout(30);
+    $app->client->async->process($tx => sub {
+#        my ( $cli, $tx ) = @_;
+        warn "request complete\n";
+        if ( $error ) {
+            # XXX check for - reason: no_db_file error: not_found
+        }
 
-    return;
-}
+        $self->watch_couchdb( $app );
 
-sub timer {
-    my $self = shift;
-    return $loop->timer( @_ );
-}
+        return;
+    });
 
-sub heartbeat {
-    my ( $self, $secs ) = @_;
-
-    if ( $self->{_hbtimerid} ) {
-        $loop->drop( delete $self->{_hbtimerid} );
-    }
-
-    my $heartbeat;
-    $heartbeat = sub {
-        $self->{client}->send_message('{"heartbeat":"1"}');
-        $self->{_hbtimerid} = $loop->timer( $secs => $heartbeat );
-    };
-
-    $self->{_hbtimerid} = $loop->timer( $secs => $heartbeat );
 }
 
 1;
@@ -248,14 +411,14 @@ Mojolicious::Plugin::Ignite - Socket.io plugin for Mojolicious
 =head1 SYNOPSIS
 
     # Mojolicious
-    $self->plugin( 'ignite' => { base => '/socket.io' });
+    $self->plugin( 'ignite' => [ 'http://127.0.0.1:5984/ignite' => 'config' ] );
 
     # Mojolicious::Lite
-    plugin 'ignite' => { base => '/socket.io' };
+    plugin 'ignite' => [ 'http://127.0.0.1:5984/ignite' => 'config' ];
 
 =head1 DESCRIPTION
 
-L<Mojolicous::Plugin::Ignite> is a socket.io handler for Mojolicious
+L<Mojolicous::Plugin::Ignite> is a socket.io server for Mojolicious
 
 =head1 METHODS
 

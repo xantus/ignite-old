@@ -8,29 +8,41 @@ BEGIN {
     $bin = join( '/', File::Spec->splitdir(dirname(__FILE__)) );
 }
 
-use lib "$bin/lib"
+use lib "$bin/lib";
 use lib "$bin/../lib";
 
 use Mojolicious::Lite;
 use Ignite::Lite;
 
+# serve static files from here
+app->static->root( "$bin/../public" ); # if ran from examples
+
+# noisy log
 app->log->level( 'debug' );
 
+# auto daemon
 @ARGV = qw( daemon ) unless @ARGV;
 
-my $buffer = [];
+# the config will be auto created for you, if the config key or db isn't found
+# to edit your config visit: http://127.0.0.1:5984/_utils/document.html?ignite/config
+ignite 'config' => 'http://127.0.0.1:5984/ignite/config';
 
+# list of last 15 msgs
+my $msgs = [];
+
+# connection from browser to mojo opened
 socketio 'open' => sub {
     my ( $client ) = @_;
 
     $client->send_message({ sessionid => $client->id });
-    $client->send_message({ buffer => $buffer });
+    $client->send_message({ buffer => $msgs });
 
     $client->broadcast({ announcement => $client->id . ' connected' });
 
     $client->heartbeat( 10 );
 };
 
+# connection from browser to mojo closed
 socketio 'close' => sub {
     my ( $client ) = @_;
 
@@ -38,14 +50,16 @@ socketio 'close' => sub {
     $client->disconnect();
 };
 
+# message sent from browser
 socketio 'message' => sub {
     my ( $client, $data ) = @_;
 
     my $msg = { message => [ $client->id, $data ] };
-    push( @$buffer, $msg );
-    shift @$buffer if ( $#{$buffer} > 15 );
+    push( @$msgs, $msg );
+    shift @$msgs if ( $#{$msgs} > 15 );
 
     $client->broadcast($msg);
 };
 
 app->start;
+

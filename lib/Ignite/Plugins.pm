@@ -35,4 +35,5 @@ sub run_hook_reverse {
 
     return $self;
 }
+
 1;
