@@ -1201,7 +1201,7 @@ io.Socket = ioClass({
 		document: document,
 		port: document.location.port || 80,
 		resource: 'socket.io',
-		transports: ['websocket'],
+		transports: ['websocket','xhr-polling'],
 //		transports: ['websocket', 'htmlfile', 'flashsocket', 'xhr-multipart', 'xhr-polling'],
 //		transports: ['xhr-polling'],
 		transportOptions: {},

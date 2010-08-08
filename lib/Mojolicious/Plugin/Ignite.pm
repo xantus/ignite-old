@@ -5,6 +5,8 @@ use warnings;
 
 use base 'Mojolicious::Plugin';
 
+__PACKAGE__->attr([qw/ couch_url /]);
+
 use Ignite::Plugins;
 use MojoX::CouchDB;
 use Digest::SHA1 qw( sha1_hex );
@@ -18,27 +20,32 @@ my $clients;
 
 BEGIN {
     $loop = Mojo::IOLoop->singleton;
+    Mojo::Client->singleton->ioloop( $loop );
     $clients = Ignite::Clients->singleton;
 };
 
 __PACKAGE__->attr([qw/ db cfg db_name /]);
-__PACKAGE__->attr( _json => sub { MojoX::JSON->singleton } );
+__PACKAGE__->attr( json => sub { MojoX::JSON->singleton } );
 __PACKAGE__->attr( plugins => sub { Ignite::Plugins->new } );
 __PACKAGE__->attr( couch => sub { MojoX::CouchDB->new } );
 # can't do this because it uses $json->error
 #__PACKAGE__->attr( couch => sub {
 #    my $c = MojoX::CouchDB->new;
-#    $c->_json_encoder( MojoX::JSON->singleton );
-#    $c->_json_decoder( MojoX::JSON->singleton );
+#    $c->json_encoder( MojoX::JSON->singleton );
+#    $c->json_decoder( MojoX::JSON->singleton );
 #    return $c;
 #});
 
-sub register {
-    my ($self, $app, $cfg_url) = @_;
+sub register { return shift }
 
-    return $self if ( $self->{configured}++ ); # hmm
+sub init {
+    my ( $self, $cfg ) = @_;
 
-    $self->_config( $app, $cfg_url ) if defined $cfg_url;
+    my $app = $ENV{MOJO_APP};
+
+    return $self if $self->{configured}++;
+
+    $self->_config( $app, $cfg ) if defined $cfg;
 
     die __PACKAGE__." - You must configure ignite with a couchdb url" unless $self->cfg;
 
@@ -46,15 +53,7 @@ sub register {
 #    warn Data::Dumper->Dump([$self->cfg]);
 
     # use the faster JSON module if available
-    if ( MojoX::JSON::HAS_JSON ) {
-        $app->plugins->add_hook(
-            after_build_tx => sub {
-                my $tx = $_[1];
-                $tx->res->json_class('JSON');
-                $tx->req->json_class('JSON');
-            }
-        );
-    }
+    MojoX::JSON->setup_hook( $app );
 
     my $base = $self->cfg->field( 'base' ) || '/socket.io';
 
@@ -67,13 +66,9 @@ sub register {
     $self->cfg->field( heartbeat => 5000 ) unless $self->cfg->field( 'heartbeat' );
 
     # XXX I don't like this
-#    $clients->couch_url( $self->{couch_url} );
 #    $clients->cfg( $self->cfg );
 
-    warn "db is ".$self->db." client is ".$clients;
-    $clients->db( $self->db );
-
-    $loop->timer( 1 => sub { $self->watch_couchdb($app); } );
+    $clients->init( $self->db_name, $self->couch_url->clone );
 
     return $self;
 }
@@ -117,7 +112,8 @@ sub _check_install {
 
     my ( $couchurl, $id ) = @$args;
 
-    my $url = $self->{couch_url} = Mojo::URL->new( $couchurl );
+    my $url = Mojo::URL->new( $couchurl );
+    $self->couch_url( $url );
 
     $self->couch->address( $url->host || '127.0.0.1' );
     $self->couch->port( $url->port || 5984 );
@@ -148,8 +144,6 @@ sub _check_install {
     $db_name = $doc->field( 'db' ) || $db_name;
     $self->db_name( $db_name );
 
-    $self->db( $self->couch->new_database( $db_name ) );
-
     $self->cfg( $doc );
 
     foreach ( @dbs ) {
@@ -160,6 +154,22 @@ sub _check_install {
     }
 }
 
+sub publish {
+    $clients->publish( undef, @_[ 1 .. $#_ ] );
+}
+
+sub subscribe {
+    $clients->subscribe( @_[ 1 .. $#_ ] );
+}
+
+sub unsubscribe {
+    $clients->unsubscribe( @_[ 1 .. $#_ ] );
+}
+
+sub broadcast {
+    $clients->publish( undef, '/meta/bcast', @_[ 1 .. $#_ ] );
+}
+
 sub _handle_websocket {
     my ( $self, $c ) = @_;
 
@@ -167,14 +177,16 @@ sub _handle_websocket {
 
     warn "websocket @_\n";
 
-    my $client = $clients->fetch_create( $c, $c->session( 'cid' ) );
+    my $cid = $c->session( 'cid' );
+    my $client = $clients->fetch_create( $c, $cid );
 
     $c->finished(sub {
         $self->plugins->run_hook( 'close', $client );
+        $clients->remove( $cid );
     });
 
     $c->receive_message(sub {
-        $self->plugins->run_hook( 'message', $client, ( $self->_json->decode( $_[1] ) )->[0] );
+        $self->plugins->run_hook( 'message', $client, ( $self->json->decode( $_[1] ) )->[0] );
     });
 
     $self->plugins->run_hook( 'open', $client );
@@ -228,16 +240,21 @@ sub _handle_xhr_polling {
 
     my $client = $clients->fetch_create( $c, $cid );
 
+    $c->finished(sub {
+        warn "client $cid finished\n";
+        $clients->remove( $cid );
+    });
+
     warn "xhr-poll\n";
     my $method = $c->req->method;
 
     if ( $method eq 'GET' ) {
         # get data if available, or wait 15s if none waiting
-        $client->recv_or_wait( 15 );
+        $client->get_data( 15 );
         return;
     } elsif ( $method eq 'POST' ) {
         if ( my $data = $c->req->param( 'data' ) ) {
-            $data = $self->_json->decode( $data );
+            $data = $self->json->decode( $data );
             if ( $data->{messages} ) {
                 foreach ( @{$data->{messages}} ) {
                     $self->plugins->run_hook( 'message', $client, $_ );
@@ -268,136 +285,6 @@ sub _origin_ok {
     }
 
     return 0;
-}
-
-sub watch_couchdb {
-    my ( $self, $app ) = @_;
-
-    my $json = $self->_json;
-
-    warn "do request\n";
-
-    my $url = $self->{couch_url}->clone;
-
-    my $db_name = $self->db_name;
-
-    $url->path( '/'.$db_name.'/_changes' );
-
-    my $seq = $self->cfg->field( 'seq' );
-    if ( $seq > 0 ) {
-        $url->query->param( since => $seq );
-    }
-    $url->query->param( heartbeat => $self->cfg->field( 'heartbeat' ) || 5000 );
-    $url->query->param( style => 'all_docs' );
-    $url->query->param( include_docs => 'true' );
-    $url->query->param( feed => 'continuous' );
-
-    warn "requesting $url\n";
-    my $tx = $app->client->async->build_tx( GET => $url );
-    my $error;
-
-    $tx->res->body(sub {
-        my $chunk = $_[1];
-
-# debugging
-#        my $c = "$chunk";
-#        $c =~ s/\x0D/\\n/g; $c =~ s/\x0A/\\r/g;
-#        warn "chunk [$c]\n";
-
-        # heartbeat
-        return if ( $chunk eq "\x0A" );
-
-        foreach ( split( /\x0A/, $chunk ) ) {
-            my $obj;
-            eval {
-                $obj = $json->decode( $_ );
-                warn Data::Dumper->Dump([$obj]);
-                if ( defined $obj->{seq} && $seq > $obj->{seq} ) {
-                    $seq = $obj->{seq};
-                    $self->cfg->field( seq => $seq );
-                    # XXX terrible
-                    $self->cfg->save;
-                }
-                #$VAR1 = {
-                #  'changes' => [
-                #                 {
-                #                   'rev' => '2-e081699c08a8eb52bd8c8eb73feabbf3'
-                #                 }
-                #               ],
-                #  'id' => '36c72dd8895a11df8cadb613e6644a9f',
-                #  'seq' => 13
-                #};
-                # do something with data: $obj
-
-                return unless ( $obj->{id} );
-                # we only care about clients actively connected: websockets or waiting longpolls, etc
-#                return unless ( $clients->fetch( $obj->{id} ) );
-
-                # check the db for this client
-#                warn "there is a waiting client: $obj->{id}\n";
-
-                my $nurl = $url->clone;
-                $nurl->path( '/'.$db_name.'/'.$obj->{id} );
-
-                $app->client->get($nurl => sub {
-                    my $doc = $_[1]->res->json;
-                    warn Data::Dumper->Dump([$doc],['doc']);
-                    # XXX
-                    return;
-                    # XXX
-                    if ( $doc->{_id} ) {
-#                        if ( my $cli = $clients->fetch( $obj->{id} ) ) {
-#                            my $input = delete $check->{input};
-#                            $check->{input} = [];
-#                            $app->client->put($nurl => $json->encode($check) => sub {
-#                                my $tx = $_[1];
-#                                warn Data::Dumper->Dump([$tx->res->json]);
-#                                # todo, failure
-#                            })->process;
-#
-#                            # client exists
-#                            warn "client exists in db too\n";
-#                            $cli->send_message($input);
-#                        }
-                        if ( $doc->{channel} ) {
-                            if ( $doc->{channel} =~ m!^/cid/(.+)! ) {
-                                warn "looking for client $1\n";
-                                if ( my $cli = $clients->fetch( $1 ) ) {
-                                    warn "found, sending message\n";
-                                    $cli->send_message( $doc->{event}, 1, 1 );
-                                }
-                            } elsif ( $doc->{channel} eq '/all' ) {
-                                warn "sending to all\n";
-                                $clients->_send_all( ( ref $doc->{event} ? $json->_json->encode( $doc->{event} ) : $doc->{event} ), $doc->{from} );
-                            }
-                        }
-                    }
-                })->process;
-            };
-            if ( $@ ) {
-                warn "Error parsing |$_|  Error Msg: $@\n";
-            }
-            if ( $obj->{error} ) {
-                $error = $obj;
-            } else {
-                $error = undef;
-            }
-        }
-    });
-
-    $app->client->keep_alive_timeout(30);
-    $app->client->async->process($tx => sub {
-#        my ( $cli, $tx ) = @_;
-        warn "request complete\n";
-        if ( $error ) {
-            # XXX check for - reason: no_db_file error: not_found
-        }
-
-        $self->watch_couchdb( $app );
-
-        return;
-    });
-
 }
 
 1;

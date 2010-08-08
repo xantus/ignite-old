@@ -14,11 +14,9 @@ my $loop;
 my $json;
 my $clients;
 
-__PACKAGE__->attr([qw/ client db /]);
+__PACKAGE__->attr([qw/ con /]);
 __PACKAGE__->attr(is_websocket => sub { 0 });
 __PACKAGE__->attr(id => sub { sha1_hex( join( '|', $_[0], time(), rand(100000) ) ) });
-__PACKAGE__->attr(buffer => sub { [] });
-__PACKAGE__->attr(buffer_count => sub { 0 });
 __PACKAGE__->attr(_timers => sub { {} });
 
 BEGIN {
@@ -33,32 +31,39 @@ sub new {
 
     my $self = bless( $args, ref $class || $class );
 
-    $self->is_websocket( $self->client->tx->is_websocket ) if $self->client;
+    $self->active;
 
-    die "client does not have db:".$self->id unless $self->db;
+    $self->is_websocket( $self->con->tx->is_websocket ) if $self->con;
 
     return $self;
 }
 
+sub active {
+    my $self = shift;
+    $self->{last_active} = time();
+    return $self;
+}
+
+# socket.io
 sub broadcast {
     my ( $self, $msg ) = @_;
 
-    my $out = $json->encode({
+    return $clients->broadcast( $self->id, {
         messages => [
             ref $msg ? $json->encode( $msg ) : $msg
         ]
     });
-
-    return $clients->broadcast( $out, $self->id );
 }
 
+# socket.io
+# unicast send to the client
 sub send_message {
     my ( $self, $msg, $encoded, $ev ) = @_;
 
-    if ( $self->client && $self->is_websocket ) {
+    if ( $self->con && $self->is_websocket ) {
         warn "sending to web socket $msg\n";
         # websocket
-        $self->client->send_message(
+        $self->con->send_message(
             $encoded ? $msg : $json->encode({
                 messages => [
                     ref $msg ? $json->encode( $msg ) : $msg
@@ -66,30 +71,37 @@ sub send_message {
             })
         );
         return;
-    } elsif ( $self->client ) {
+    } elsif ( $self->con ) {
         # longpoll waiting, etc
-        if ( $self->{_resume} ) {
-            push( @{ $self->buffer }, ref $msg ? $json->encode( $msg ) : $msg );
-            $self->{_resume}->();
+        if ( my $cb = delete $self->{_resume} ) {
+            $cb->({ 
+                messages => [
+                    ref $msg ? $json->encode( $msg ) : $msg
+                ]
+            });
             return;
         }
     }
 
     return if $ev;
 
-    # client must not be currently connected, send it to couch
-    $clients->add_event( '/cid/'.$self->id, ref $msg ? $json->encode( $msg ) : $msg );
+    # client must not be currently connected, publish it
+    $clients->publish( '/meta/unicast/'.$self->id, {
+        channel => '/socket.io',
+        messages => [ ref $msg ? $json->encode( $msg ) : $msg ]
+    });
 
     return;
 }
 
+# socket.io
 sub disconnect {
     my $self = shift;
 
-    if ( my $resume = delete $self->{_resume} ) {
-        $resume->();
+    if ( my $cb = delete $self->{_resume} ) {
+        $cb->({ messages => [] });
     } else {
-        $loop->drop( $self->client->tx ) if $self->client;
+        $loop->drop( $self->con->tx ) if $self->con;
     }
 
     foreach ( values %{ $self->_timers } ) {
@@ -102,6 +114,18 @@ sub disconnect {
     return;
 }
 
+sub publish {
+    $clients->publish( shift, shift->id, @_ );
+}
+
+sub subscribe {
+    $clients->subscribe( shift->id, @_ );
+}
+
+sub unsubscribe {
+    $clients->unsubscribe( shift->id, @_ );
+}
+
 sub timer {
     return $loop->timer( @_[ 1 .. $#_ ] );
 }
@@ -109,7 +133,7 @@ sub timer {
 sub heartbeat {
     my ( $self, $secs ) = @_;
 
-#    return unless $self->is_websocket;
+    return unless $self->is_websocket;
 
     if ( my $id = delete $self->_timers->{heartbeat} ) {
         $loop->drop( $id );
@@ -117,7 +141,7 @@ sub heartbeat {
 
     my $heartbeat;
     $heartbeat = sub {
-        $self->client->send_message('{"heartbeat":"1"}'); # no need to json encode this
+        $self->con->send_message('{"heartbeat":"1"}'); # no need to json encode this
         $self->_timers->{heartbeat} = $loop->timer( $secs => $heartbeat );
     };
 
@@ -126,50 +150,51 @@ sub heartbeat {
     return;
 }
 
-sub wait_for_data {
-    my ( $self, $secs ) = @_;
-
-    return if $self->is_websocket || $self->_timers->{longpoll} || !$self->client;
-
-    $self->client->tx->pause;
-
-    $self->_timers->{longpoll} = $loop->timer( $secs || 15 => $self->{_resume} = sub {
-        delete $self->{_resume};
-        $loop->drop( delete $self->_timers->{longpoll} );
-        $self->client->tx->resume;
-        $self->client->render_json({ messages => $self->buffer });
-    });
-
-    return;
-}
-
-sub recv_or_wait {
-    my ( $self, $secs ) = @_;
-
-    return if $self->is_websocket || $self->_timers->{longpoll} || !$self->client;
-
-    $self->get_data( $self->id );
-
-#    if ( $self->buffer_count ) {
-    if ( @{ $self->buffer } ) {
-        $self->client->render_json({ messages => $self->buffer });
-        return;
-    }
-
-    # no msgs waiting, wait until $secs or a msg comes in
-    $self->wait_for_data( $secs );
-
-    return;
-}
-
 sub get_data {
-    my $self = shift;
+    my ( $self, $secs ) = @_;
 
-    my $data = $clients->get_data( $self->id );
+    return if $self->is_websocket || $self->_timers->{longpoll} || !$self->con;
 
-    if ( $data ) {
-        push( @{ $self->buffer }, @$data );
-    }
+    $self->con->tx->pause unless $self->is_websocket;
+
+    # get data, or wait for it
+    $clients->get_data( $self->id, sub {
+        my $data = shift;
+        warn Data::Dumper->Dump([$data],['data']);
+
+        if ( @$data ) {
+            if ( $self->is_websocket ) {
+                # websocket
+                $self->con->send_message( $json->encode( $data ) );
+            } elsif ( my $cb = delete $self->{_resume} ) {
+                # longpoll
+                $cb->({ messages => $data });
+            } else {
+                # simple request
+                $self->con->tx->resume;
+                $self->con->render_json({ messages => $data });
+            }
+            return;
+        }
+
+        $secs ||= 15;
+
+        warn "waiting $secs for data\n";
+        $self->{_resume} = sub {
+            my $ret = $_[1];
+            delete $self->{_resume};
+            $loop->drop( delete $self->_timers->{longpoll} );
+            $self->con->tx->resume;
+            if ( ref $ret eq 'ARRAY' ) {
+                warn Data::Dumper->Dump([$ret],['ret']);
+                $self->con->render_json({ messages => $ret });
+            } else {
+                warn "longpoll timed out\n";
+                $self->con->render_json({ messages => [] });
+            }
+        };
+        $self->_timers->{longpoll} = $loop->timer( $secs => $self->{_resume} );
+    });
 
     return;
 }

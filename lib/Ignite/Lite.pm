@@ -18,31 +18,21 @@ sub import {
     my $app = $ENV{MOJO_APP} or die 'You must use Mojolicious::Lite before Ignite::Lite';
 
     my $ignite = undef;
-    my $config = undef;
 
     *{"${caller}::socketio"} = sub {
         my $event = shift or die 'usage: socketio \'event\' => sub { ... }';
 
-        die "you must specify a config before any socketio commands, try: ignite 'config' => 'http://127.0.0.1:5984/ignite/config';"
-            unless defined $config;
+        die "You must ignite->init( \$couchurl ) first\n" unless defined $ignite;
 
-        # auto load the plugin
-        unless ( defined $ignite ) {
-            $ENV{IGNITE_PLUGIN} = $ignite = $app->plugins->load_plugin( $app, 'ignite', { config => $config } );
-        }
-        $ignite->plugins->add_hook( $event => @_ ) unless $event eq 'config';
+        $ignite->plugins->add_hook( $event => @_ );
     };
 
     *{"${caller}::ignite"} = sub {
-        my $event = shift or die 'usage: ignite \'event\' => sub { ... }';
-
-        if ( $event eq 'config' ) {
-            $config = shift or die 'usage ignite \'config\' => \'http://127.0.0.1:5984/ignite\'';
-            $ignite->_config( $app, $config ) if defined $ignite;
-            return;
+        # auto load the plugin
+        unless ( defined $ignite ) {
+            $ENV{IGNITE_PLUGIN} = $ignite = $app->plugins->load_plugin( $app, 'ignite' );
         }
-
-        warn "Ignite::Lite - ignored: $event";
+        return $ignite;
     };
 }
 
@@ -58,9 +48,9 @@ Ignite::Lite - Socket.io plugin for Mojolicious::Lite
 
     use Ignite::Lite;
 
-    ignite 'config' => 'http://127.0.0.1:5984/ignite'; # config key assumed
+    ignite->init( 'http://127.0.0.1:5984/ignite' ); # config key is assumed
     # or
-    ignite 'config' => [ 'http://127.0.0.1:5984/ignite' => 'config' ]; # config key assumed
+    ignite->init( 'http://127.0.0.1:5984/ignite/config' );
 
     socketio 'open' => sub { my ( $client, $plugin ) = @_; ... }
     socketio 'close' => sub { my ( $client, $plugin ) = @_; ... }
@@ -77,15 +67,19 @@ L<Ignite::Lite> is socket.io for Mojolicious::Lite
 
     # events suppported: open, close, message
 
-    socketio 'open' => sub { my ( $client, $plugin ) = @_; ... }
-    socketio 'close' => sub { my ( $client, $plugin ) = @_; ... }
-    socketio 'message' => sub { my ( $client, $plugin ) = @_; ... }
+    socketio 'open' => sub { my $client = shift; ... }
+    socketio 'close' => sub { my $client = shift; ... }
+    socketio 'message' => sub { my ( $client, $msg ) = @_; ... }
 
-=head2 C<ignite> $cmd => $params
+=head2 C<ignite>
 
-    # currently only 'config' is supported when using the ignite method
+    returns the ignite singleton
 
-    ignite 'config' => 'http://127.0.0.1:5984/ignite'; # couchdb url to ignite db
+=head2 C<publish>
+
+=head2 C<subscribe>
+
+=head2 C<broadcast>
 
 =head1 SEE ALSO
 

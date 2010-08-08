@@ -1,0 +1,33 @@
+#!/usr/bin/perl
+
+use Mojo::Client;
+use Data::Dumper;
+use JSON;
+
+my $client = Mojo::Client->singleton;
+
+my $j = [];
+foreach ( 1 .. $ARGV[0] || 1 ) {
+    push( @$j, {
+        channel => '/foo/bar',
+#        data => scalar( `/usr/games/fortune -s` )
+        data => 'foo'
+    });
+    $j->[-1]->{data} =~ s/\n$//g;
+    $j->[-1]->{data} =~ s/\n/\\n/;
+#    print $j->[-1]->{data}."\n";
+}
+
+
+my $tx = Mojo::Client->singleton->build_tx( POST => 'http://127.0.0.1:5984/events/_bulk_docs' );
+my $content = Mojo::Content::Single->new;
+$content->asset->add_chunk(JSON::encode_json({ docs => $j }));
+$tx->req->content($content);
+$tx->req->headers->content_type( 'application/json' );
+
+$client->process( $tx => sub {
+    my $json = $_[1]->res->json;
+    warn Data::Dumper->Dump([$json],['json']);
+});
+
+
