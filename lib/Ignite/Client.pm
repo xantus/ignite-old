@@ -157,7 +157,7 @@ sub get_data {
 
     return if !$self->con || $self->_timers->{longpoll};
 
-    return $clients->get_client_data_websocket( $self->id, $self->con ) if $self->is_websocket;
+    return $clients->get_client_data_websocket( $self->id ) if $self->is_websocket;
 
     $self->con->tx->pause;
 

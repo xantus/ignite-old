@@ -191,6 +191,8 @@ sub watch_client {
     $tx->res->body(sub {
         my $chunk = $_[1];
 
+        # XXX check client con if its still here
+
         # heartbeat
         return if ( $chunk eq "\x0A" );
 
