@@ -818,6 +818,9 @@ io.Transport = ioClass({
 	},
 
 	_onData: function(data){
+        if ( 'console' in window ) {
+            console.log( data );
+        }
 		var msgs;
 		if (typeof data === 'string'){
 			try {
@@ -836,7 +839,7 @@ io.Transport = ioClass({
 	_onMessage: function(message){
 		if (!('sessionid' in this)){
 			try {
-				var obj = JSON.parse(message);
+				var obj = ( typeof message == 'string' ) ? JSON.parse(message) : message;
 			} catch(e){}
 			if (obj && obj.sessionid){
 				this.sessionid = obj.sessionid;
@@ -1059,7 +1062,7 @@ io.Transport.htmlfile = io.Transport.extend({
 		this._doc.body.appendChild(_iframeC);
 		this._iframe = this._doc.createElement('iframe');
 		_iframeC.appendChild(this._iframe);
-		this._iframe.src = this._prepareUrl() + '/' + (+ new Date);
+		this._iframe.src = this._prepareUrl() + '?_r=' + (+ new Date);
 	},
 	
 	_: function(data, doc){
@@ -1151,7 +1154,7 @@ io.Transport['xhr-multipart'].xdomainCheck = function(){
 
 		connect: function(){
 			var self = this;
-			this._xhr = this._request(+ new Date, 'GET');
+			this._xhr = this._request( '?_r='+(+ new Date), 'GET');
 			if ('onload' in this._xhr){
 				this._xhr.onload = function(){
 					if (this.responseText.length) self._onData(this.responseText);

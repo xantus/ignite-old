@@ -51,11 +51,7 @@ sub active {
 sub broadcast {
     my ( $self, $msg ) = @_;
 
-    return $clients->broadcast( $self->id, {
-        messages => [
-            ref $msg ? $json->encode( $msg ) : $msg
-        ]
-    });
+    return $clients->broadcast( $self->id, $msg );
 }
 
 # socket.io
@@ -66,22 +62,16 @@ sub send_message {
     if ( $self->con && $self->is_websocket ) {
         warn "sending to web socket $msg\n";
         # websocket
-        $self->con->send_message(
-            $encoded ? $msg : $json->encode({
-                messages => [
-                    ref $msg ? $json->encode( $msg ) : $msg
-                ]
-            })
-        );
+        $self->con->send_message($json->encode({
+            messages => [
+               $msg
+            ]
+        }));
         return;
     } elsif ( $self->con ) {
         # longpoll waiting, etc
         if ( my $cb = delete $self->{_resume} ) {
-            $cb->({ 
-                messages => [
-                    ref $msg ? $json->encode( $msg ) : $msg
-                ]
-            });
+            $cb->($msg);
             return;
         }
     }
@@ -89,9 +79,7 @@ sub send_message {
     return if $ev;
 
     # the client must not be currently connected, publish it
-    $clients->publish( '/meta/unicast/'.$self->id, {
-        messages => [ ref $msg ? $json->encode( $msg ) : $msg ]
-    });
+    $clients->publish( '/meta/unicast/'.$self->id, $msg );
 
     return;
 }
@@ -174,6 +162,8 @@ sub get_data {
                 # simple request
                 $self->con->tx->resume;
                 $self->con->render_json({ messages => $data });
+                $self->con->finish;
+                $clients->remove( $self->id );
             }
             return;
         }
@@ -182,7 +172,7 @@ sub get_data {
 
         warn "waiting $secs for data\n";
         $self->{_resume} = sub {
-            my $ret = $_[1];
+            my $ret = $_[0];
             delete $self->{_resume};
             $loop->drop( delete $self->_timers->{longpoll} );
             $self->con->tx->resume;
@@ -193,8 +183,12 @@ sub get_data {
                 warn "longpoll timed out\n";
                 $self->con->render_json({ messages => [] });
             }
+            $self->con->finish;
+            $clients->remove( $self->id );
         };
         $self->_timers->{longpoll} = $loop->timer( $secs => $self->{_resume} );
+
+        $clients->watch_client( $self->id );
     });
 
     return;

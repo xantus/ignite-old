@@ -36,7 +36,7 @@
       });
       socket.connect();
       socket.addEvent('message', function(data){
-        var obj = JSON.parse(data);
+        var obj = ( typeof data == 'object' ) ? data : JSON.parse(data);
 
         if ('buffer' in obj){
           for (var i in obj.buffer) message(obj.buffer[i]);
@@ -44,7 +44,7 @@
       });      
     </script>
     
-    <h1>Sample chat client</h1>
+    <!--h1>Sample chat client</h1-->
     <div id="chat"><p>Connecting...</p></div>
     <form id="form" onsubmit="send(); return false">
       <input type="text" autocomplete="off" id="text"><input type="submit" value="Send">

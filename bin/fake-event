@@ -31,3 +31,4 @@ $client->process( $tx => sub {
 });
 
 
+# curl -X POST http://localhost:5984/events/_bulk_docs -H 'Content-Type: application/json' -d '{"docs":[{"channel":"/foo/bar","data":"baz"},{"channel":"/foo/bar","data":"foobar"}]}'

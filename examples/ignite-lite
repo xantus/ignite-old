@@ -30,7 +30,7 @@ ignite->init( 'http://127.0.0.1:5984/ignite/config' );
 # list of last 15 msgs
 my $msgs = [];
 
-# connection from browser to mojo opened
+# connection from browser to ignite opened
 socketio 'open' => sub {
     my ( $client ) = @_;
 
@@ -42,7 +42,7 @@ socketio 'open' => sub {
     $client->heartbeat( 10 );
 };
 
-# connection from browser to mojo closed
+# connection from browser to ignite closed
 socketio 'close' => sub {
     my ( $client ) = @_;
 
@@ -50,7 +50,7 @@ socketio 'close' => sub {
     $client->disconnect();
 };
 
-# message sent from browser
+# message sent from browser to ignite
 socketio 'message' => sub {
     my ( $client, $data ) = @_;
 
@@ -61,5 +61,6 @@ socketio 'message' => sub {
     $client->broadcast($msg);
 };
 
+print "go to http://localhost:3000/examples/chat.html\n";
 app->start;
 

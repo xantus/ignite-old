@@ -43,17 +43,17 @@ sub fetch_create {
     if ( exists $clients->{ $cid } ) {
         return $clients->{ $cid }->active;
     } else {
-
         my $created = time();
 
         # get the client info
         Mojo::Client->singleton->get( $self->dburl( 'clients', $cid ) => sub {
             return unless my $obj = $self->json->decode( $_[1]->res->body );
             warn Data::Dumper->Dump([$obj],['get_cli_'.$cid]);
-            # XXX location of client db (it can be on another couch)
+            # XXX get location of client db (it can be on another couch)
             if ( $obj->{error} && $obj->{error} eq 'not_found' ) {
                 $self->bulk_update( 'clients' , [{
                     _id => $cid,
+                    uid => $c->session( 'uid' ),
                     created => $created,
                     transport => $transport
                 }] );
@@ -69,6 +69,7 @@ sub fetch_create {
         $clients->{ $cid } = Ignite::Client->new(
             con => $c,
             id => $cid,
+            uid => $c->session( 'uid' ),
             created => $created,
             transport => $transport
         );
@@ -78,7 +79,7 @@ sub fetch_create {
         Mojo::Client->singleton->get( $self->dburl( "cli_$cid" ) => sub {
             return unless my $obj = $self->json->decode( $_[1]->res->body );
             warn Data::Dumper->Dump([$obj],['cli_data_'.$cid]);
-            $clients->{ $cid}->seq( $obj->{update_seq} ) if $obj->{update_seq};
+            $clients->{ $cid }->seq( $obj->{update_seq} ) if $obj->{update_seq} && $clients->{ $cid };
             # XXX doc_count, instance_start_time
         });
 
@@ -103,11 +104,21 @@ sub publish {
         unshift( @msgs, $cid );
         $cid = undef;
     }
+    if ( ref $ch ) {
+        unshift( @msgs, $ch );
+        $ch = undef;
+    }
 
     return unless @msgs;
-    foreach ( @msgs ) { $_->{channel} = $ch; $_->{from} = $cid if $cid; }
+    foreach ( @msgs ) {
+#        $_->{channel} = $ch unless defined $ch && $ch =~ m!^/meta/!;
+        $_->{channel} = $ch if $ch;
+#        delete $_->{channel} if defined $ch && $ch =~ m!^/meta/!;
+        $_->{from} = $cid if $cid;
+    }
 
-    if ( !ref( $ch ) && $ch =~ m!^/meta/unicast/(.*)! ) {
+    if ( defined $ch && $ch =~ m!^/meta/unicast/(.*)! ) {
+        warn "unicast to $1\n";
         $self->bulk_update( "cli_$1", \@msgs );
     } else {
         $self->bulk_update( $self->db_name, \@msgs );
@@ -119,8 +130,14 @@ sub remove {
 
     my $cli = delete $self->clients->{ $cid };
 
-    if ( $cli->is_websocket ) {
-        warn "removed websocket $cid\n";
+    if ( $cli ) {
+        if ( $cli->{txid} ) {
+            Mojo::IOLoop->singleton->drop( $cli->{txid} );
+            warn "droping watch client txid: $cli->{txid}\n";
+        }
+        if ( $cli->is_websocket ) {
+            warn "removed websocket $cid\n";
+        }
     }
 
     return;
@@ -173,9 +190,8 @@ sub watch_client {
 
     my $json = $self->json;
     my $client = Mojo::Client->singleton;
-    $client->async;
 
-    warn "_changes request - websocket watcher seq:".$self->clients->{ $cid }->seq."\n";
+    warn "_changes request - client watcher seq:".$self->clients->{ $cid }->seq."\n";
 
     my $url = $self->dburl( "cli_$cid", '_changes', {
         since => $self->clients->{ $cid }->seq,
@@ -189,9 +205,13 @@ sub watch_client {
     my $tx = $client->build_tx( GET => $url );
 
     $tx->res->body(sub {
+        $self->clients->{ $cid }->{txid} = $tx->connection;
         my $chunk = $_[1];
 
         # XXX check client con if its still here
+#        my $c = "$chunk";
+#        $c =~ s/\x0D/\\n/g; $c =~ s/\x0A/\\r/g;
+#        warn "chunk [$c]\n";
 
         # heartbeat
         return if ( $chunk eq "\x0A" );
@@ -209,6 +229,9 @@ sub watch_client {
 
                 warn Data::Dumper->Dump([$obj],['ws_data']);
 
+                # ignore msgs from self
+                delete $obj->{doc} if ( $obj->{doc} && $obj->{doc}->{from} && $obj->{doc}->{from} eq $cid );
+
                 push( @msgs, $obj->{doc} ) if $obj->{doc};
             };
             if ( $@ ) {
@@ -216,6 +239,14 @@ sub watch_client {
             }
             if ( $obj->{error} ) {
                 warn Data::Dumper->Dump([$obj],['error']);
+                if ( $obj->{reason} && $obj->{reason} eq 'no_db_file' ) {
+                    warn "no db file for client, creating...\n";
+                    Mojo::Client->singleton->put( $self->dburl( "cli_$cid" ) => sub {
+                        warn Data::Dumper->Dump([$_[1]->res->body]);
+                        Mojo::IOLoop->singleton->timer( 1 => sub { $self->watch_client( $cid ) });
+                    })->process;
+                    return;
+                }
             }
         }
 
@@ -229,14 +260,20 @@ sub watch_client {
         }
 
         warn Data::Dumper->Dump([\@msgs],['msgs_'.$cid]) if @msgs;
-        $self->clients->{ $cid }->con->send_message( $json->encode({ messages => \@msgs }) ) if @msgs;
+        if ( @msgs ) {
+            $self->clients->{ $cid }->con->send_message( $json->encode({ messages => \@msgs }) )
+                if $self->clients->{ $cid }->is_websocket;
+
+            $self->clients->{ $cid }->{_resume}->( \@msgs )
+                if $self->clients->{ $cid }->{_resume};
+        }
 
         $self->bulk_update( "cli_$cid", \@todelete ) if @todelete;
     });
 
-    $client->process($tx => sub {
-        warn "websocket watcher request done\n";
-        Mojo::IOLoop->singleton->timer( 1 => sub { $self->watch_client( $cid ) });
+    $client->async->process($tx => sub {
+        warn "client watcher request done :".$tx->connection."\n";
+        #Mojo::IOLoop->singleton->timer( 1 => sub { $self->watch_client( $cid ) });
     });
 }
 
@@ -330,6 +367,9 @@ sub deliver_events {
         if ( $ch =~ m!^/meta/! ) {
             if ( $ch eq '/meta/bcast' ) {
                 $u = $self->dburl( 'clients', '_all_docs' );
+            } elsif ( $ch =~ m!^/meta/unicast/(.*)! ) {
+                $self->bulk_update( "cli_$1", $events->{$ch} );
+                next;
             } else {
                 warn "ignored events on $ch\n";
                 warn Data::Dumper->Dump([$events->{$ch}],['ch_'.$ch]);
@@ -365,7 +405,6 @@ sub watch_couchdb {
 
     my $json = $self->json;
     my $client = Mojo::Client->singleton;
-    $client->async;
 
     warn "_changes request\n";
 
@@ -423,7 +462,6 @@ sub watch_couchdb {
         $self->deliver_events( $events );
     });
 
-#    $client->keep_alive_timeout(30);
     $client->process($tx => sub {
         warn "request complete\n";
         if ( $error ) {

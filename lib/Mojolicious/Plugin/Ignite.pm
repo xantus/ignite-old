@@ -9,18 +9,19 @@ __PACKAGE__->attr([qw/ couch_url /]);
 
 use Ignite::Plugins;
 use MojoX::CouchDB;
+use Mojo::Client;
+use Mojo::IOLoop;
 use Digest::SHA1 qw( sha1_hex );
 use Ignite::Clients;
 
 use MojoX::JSON;
 
 our $VERSION = '1.00';
-my $loop;
 my $clients;
 
 BEGIN {
-    $loop = Mojo::IOLoop->singleton;
-    Mojo::Client->singleton->ioloop( $loop );
+    Mojo::Client->singleton->ioloop( Mojo::IOLoop->singleton );
+    Mojo::Client->singleton->keep_alive_timeout(30);
     $clients = Ignite::Clients->singleton;
 };
 
@@ -59,17 +60,32 @@ sub init {
 
     # XXX detour?
     $app->routes->route( $base.'/websocket' )->websocket->to({ cb => sub { $self->_handle_websocket( @_ ); } });
-    $app->routes->route( $base.'/xhr-polling/:r' )->to({ cb => sub { $self->_handle_xhr_polling( @_ ); } });
+    $app->routes->route( $base.'/xhr-polling' )->to({ cb => sub { $self->_handle_xhr_polling( @_ ); } });
+    $app->routes->route( $base.'/xhr-polling/:cid' )->to({ cb => sub { $self->_handle_xhr_polling( @_ ); } });
+    $app->routes->route( $base.'/xhr-polling/:cid/send' )->via( 'post' )->to({ cb => sub { $self->_handle_xhr_polling( @_ ); } });
 #    $app->routes->route( $base )->to({ cb => sub { $self->_dispatch( @_ ); } });
 
     $self->cfg->field( heartbeat => 5000 ) unless $self->cfg->field( 'heartbeat' );
 
-    # XXX I don't like this
-#    $clients->cfg( $self->cfg );
-
     $clients->init( $self->db_name, $self->couch_url->clone );
 
     return $self;
+}
+
+sub publish {
+    $clients->publish( @_[ 1 .. $#_ ] );
+}
+
+sub subscribe {
+    $clients->subscribe( @_[ 1 .. $#_ ] );
+}
+
+sub unsubscribe {
+    $clients->unsubscribe( @_[ 1 .. $#_ ] );
+}
+
+sub broadcast {
+    $clients->publish( '/meta/bcast', @_[ 1 .. $#_ ] );
 }
 
 sub _config {
@@ -124,18 +140,14 @@ sub _check_install {
 
     my $doc = $db->get_document( $config_key );
 
-    my @dbs = $self->couch->all_databases;
-
-    #if ( $doc->error ) {
+    # TODO dump MojoX::CouchDB
     if ( $doc->isa( 'MojoX::CouchDB::Error' ) ) {
-        my @exists = grep { warn $_->name; $_->name eq $db_name } @dbs;
+        my @exists = grep { warn $_->name; $_->name eq $db_name } $self->couch->all_databases;
         $db->create unless @exists;
         $doc = $db->create_document( $config_key,
             base => '/socket.io',
             mojo_config => {
-                # use a uuid as a secret
-#               secret => $db->raw_get( '/_uuids' )->field( 'uuids' )->[0]
-               secret => sha1_hex( time().'|'.rand(100000) )
+               secret => sha1_hex( join('|', $self, time(), rand(100000) ) )
             }
         );
     }
@@ -144,29 +156,37 @@ sub _check_install {
     $self->db_name( $db_name );
 
     $self->cfg( $doc );
+}
 
-    foreach ( @dbs ) {
-        if ( $_->name =~ m/^ignite_cli_(.*)/ ) {
-            warn "found client db: $1\n";
+sub _dispatch {
+    my ( $self, $c ) = @_;
 
+    warn "dispatch\n";
+
+    $c->render_json({});
+}
+
+sub _setup_session {
+    my ( $self, $c ) = @_;
+
+    my $uid = $c->session( 'uid' );
+    my $cid = $c->stash( 'cid' );
+
+    # session creation
+    unless ( $uid ) {
+        if ( $c->param( 'cookietest' ) ) {
+            $c->render_text( 'Cookies must be turned on' );
+            return;
         }
+        $uid = sha1_hex( join( '|', $c, time(), rand(100000) ) );
+        $c->session( uid => $uid );
+        $cid ||= sha1_hex( join( '|', $uid, time(), rand(100000) ) );
+        my $base = $self->cfg->field('base') || '/socket.io';
+        $c->redirect_to( $base.'/xhr-polling/'.$cid.'?cookietest=1' );
+        return;
     }
-}
 
-sub publish {
-    $clients->publish( undef, @_[ 1 .. $#_ ] );
-}
-
-sub subscribe {
-    $clients->subscribe( @_[ 1 .. $#_ ] );
-}
-
-sub unsubscribe {
-    $clients->unsubscribe( @_[ 1 .. $#_ ] );
-}
-
-sub broadcast {
-    $clients->publish( undef, '/meta/bcast', @_[ 1 .. $#_ ] );
+    return $uid;
 }
 
 sub _handle_websocket {
@@ -176,12 +196,15 @@ sub _handle_websocket {
 
     warn "websocket @_\n";
 
-    my $cid = $c->session( 'cid' );
+    # XXX does websocket upgrade allow redirection?
+    my $uid = $c->session( 'uid' );
+    unless ( $uid ) {
+        $c->session( uid => $uid = sha1_hex( join( '|', $c, time(), rand(100000) ) ) );
+    }
 
-    # session creation
+    my $cid = $c->stash( 'cid' );
     unless ( $cid ) {
-        $cid = sha1_hex( join( '|', $c, time(), rand(100000) ) );
-        $c->session( cid => $cid );
+        $c->stash( cid => $cid = sha1_hex( join( '|', $uid, time(), rand(100000) ) ) );
     }
 
     my $client = $clients->fetch_create( $c, $cid, 'websocket' );
@@ -202,36 +225,6 @@ sub _handle_websocket {
     return
 }
 
-sub _dispatch {
-    my ( $self, $c ) = @_;
-
-    warn "dispatch\n";
-
-    $c->render_json({});
-}
-
-sub _setup_session {
-    my ( $self, $c ) = @_;
-
-    my $cid = $c->session( 'cid' );
-
-    # session creation
-    unless ( $cid ) {
-        if ( $c->param( 'cookietest' ) ) {
-            $c->render_text( 'Cookies must be turned on' );
-            return;
-        }
-        $cid = sha1_hex( join( '|', $c, time(), rand(100000) ) );
-        $c->session( cid => $cid );
-        warn "created session $cid\n";
-        my $base = $self->cfg->field('base') || '/socket.io';
-        $c->redirect_to( $base.'/xhr-polling/'.time().'?cookietest=1' );
-        return;
-    }
-
-    return $cid;
-}
-
 sub _handle_xhr_polling {
     my ( $self, $c ) = @_;
 
@@ -243,29 +236,44 @@ sub _handle_xhr_polling {
         }
     }
 
-    my $cid = $self->_setup_session( $c );
-    return unless $cid;
+    return unless my $uid = $self->_setup_session( $c );
+
+    my $cid = $c->stash( 'cid' );
+    my $new;
+    unless ( $cid ) {
+        $c->stash( cid => $cid = sha1_hex( join( '|', $uid, time(), rand(100000) ) ) );
+        warn "new cid $cid\n";
+        $new = 1;
+    }
 
     my $client = $clients->fetch_create( $c, $cid, 'xhr-polling' );
 
+    # XXX doesn't seem to be called
     $c->finished(sub {
         warn "client $cid finished\n";
         $clients->remove( $cid );
     });
 
-    warn "xhr-poll\n";
     my $method = $c->req->method;
 
     if ( $method eq 'GET' ) {
-        # get data if available, or wait 15s if none waiting
-        $client->get_data( 15 );
+        $self->plugins->run_hook( 'open', $client ) if $new;
+
+        # get data if available, or wait 10s if none waiting
+        $client->get_data( 10 );
         return;
     } elsif ( $method eq 'POST' ) {
         if ( my $data = $c->req->param( 'data' ) ) {
             $data = $self->json->decode( $data );
-            if ( $data->{messages} ) {
-                foreach ( @{$data->{messages}} ) {
-                    $self->plugins->run_hook( 'message', $client, $_ );
+            if ( ref $data eq 'ARRAY' ) {
+                foreach ( @$data ) {
+                    $self->plugins->run_hook( 'message', $client, $data );
+                }
+            } elsif ( ref $data eq 'HASH' ) {
+                if ( $data->{messages} ) {
+                    foreach ( @{$data->{messages}} ) {
+                        $self->plugins->run_hook( 'message', $client, $_ );
+                    }
                 }
             }
         }
