@@ -14,8 +14,10 @@ my $loop;
 my $json;
 my $clients;
 
-__PACKAGE__->attr([qw/ con /]);
-__PACKAGE__->attr(is_websocket => sub { 0 });
+__PACKAGE__->attr([qw/ con transport /]);
+__PACKAGE__->attr(is_websocket => 0);
+__PACKAGE__->attr(is_longpoll => 0);
+__PACKAGE__->attr(seq => 0);
 __PACKAGE__->attr(id => sub { sha1_hex( join( '|', $_[0], time(), rand(100000) ) ) });
 __PACKAGE__->attr(_timers => sub { {} });
 
@@ -34,6 +36,7 @@ sub new {
     $self->active;
 
     $self->is_websocket( $self->con->tx->is_websocket ) if $self->con;
+    $self->is_longpoll( 1 ) if $self->transport =~ m/longpoll/;
 
     return $self;
 }
@@ -85,9 +88,8 @@ sub send_message {
 
     return if $ev;
 
-    # client must not be currently connected, publish it
+    # the client must not be currently connected, publish it
     $clients->publish( '/meta/unicast/'.$self->id, {
-        channel => '/socket.io',
         messages => [ ref $msg ? $json->encode( $msg ) : $msg ]
     });
 
@@ -153,20 +155,19 @@ sub heartbeat {
 sub get_data {
     my ( $self, $secs ) = @_;
 
-    return if $self->is_websocket || $self->_timers->{longpoll} || !$self->con;
+    return if !$self->con || $self->_timers->{longpoll};
 
-    $self->con->tx->pause unless $self->is_websocket;
+    return $clients->get_client_data_websocket( $self->id, $self->con ) if $self->is_websocket;
+
+    $self->con->tx->pause;
 
     # get data, or wait for it
-    $clients->get_data( $self->id, sub {
+    $clients->get_client_data( $self->id, sub {
         my $data = shift;
         warn Data::Dumper->Dump([$data],['data']);
 
         if ( @$data ) {
-            if ( $self->is_websocket ) {
-                # websocket
-                $self->con->send_message( $json->encode( $data ) );
-            } elsif ( my $cb = delete $self->{_resume} ) {
+            if ( my $cb = delete $self->{_resume} ) {
                 # longpoll
                 $cb->({ messages => $data });
             } else {

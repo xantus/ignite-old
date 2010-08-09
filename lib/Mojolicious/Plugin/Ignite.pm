@@ -62,7 +62,6 @@ sub init {
     $app->routes->route( $base.'/xhr-polling/:r' )->to({ cb => sub { $self->_handle_xhr_polling( @_ ); } });
 #    $app->routes->route( $base )->to({ cb => sub { $self->_dispatch( @_ ); } });
 
-    $self->cfg->field( seq => 0 ) unless defined $self->cfg->field( 'seq' );
     $self->cfg->field( heartbeat => 5000 ) unless $self->cfg->field( 'heartbeat' );
 
     # XXX I don't like this
@@ -178,7 +177,14 @@ sub _handle_websocket {
     warn "websocket @_\n";
 
     my $cid = $c->session( 'cid' );
-    my $client = $clients->fetch_create( $c, $cid );
+
+    # session creation
+    unless ( $cid ) {
+        $cid = sha1_hex( join( '|', $c, time(), rand(100000) ) );
+        $c->session( cid => $cid );
+    }
+
+    my $client = $clients->fetch_create( $c, $cid, 'websocket' );
 
     $c->finished(sub {
         $self->plugins->run_hook( 'close', $client );
@@ -190,6 +196,8 @@ sub _handle_websocket {
     });
 
     $self->plugins->run_hook( 'open', $client );
+
+    $client->get_data();
 
     return
 }
@@ -213,11 +221,11 @@ sub _setup_session {
             $c->render_text( 'Cookies must be turned on' );
             return;
         }
-        $cid = sha1_hex( time() + rand(100000) );
+        $cid = sha1_hex( join( '|', $c, time(), rand(100000) ) );
         $c->session( cid => $cid );
         warn "created session $cid\n";
-        my $base = $c->cfg->field('base') || '/socket.io';
-        $c->redirect_to( $base.'/xhr-polling'.time().'?cookietest=1' );
+        my $base = $self->cfg->field('base') || '/socket.io';
+        $c->redirect_to( $base.'/xhr-polling/'.time().'?cookietest=1' );
         return;
     }
 
@@ -238,7 +246,7 @@ sub _handle_xhr_polling {
     my $cid = $self->_setup_session( $c );
     return unless $cid;
 
-    my $client = $clients->fetch_create( $c, $cid );
+    my $client = $clients->fetch_create( $c, $cid, 'xhr-polling' );
 
     $c->finished(sub {
         warn "client $cid finished\n";
