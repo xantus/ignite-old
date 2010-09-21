@@ -818,9 +818,12 @@ io.Transport = ioClass({
 	},
 
 	_onData: function(data){
-        if ( 'console' in window ) {
+        if ( Ext.log )
+            Ext.log( data );
+/*        if ( 'console' in window ) {
             console.log( data );
         }
+*/
 		var msgs;
 		if (typeof data === 'string'){
 			try {
@@ -843,6 +846,8 @@ io.Transport = ioClass({
 			} catch(e){}
 			if (obj && obj.sessionid){
 				this.sessionid = obj.sessionid;
+                if ( 'console' in window )
+                    console.log('session id: '+this.sessionid);
 				this._onConnect();
 			}				
 		} else {	
@@ -1206,7 +1211,6 @@ io.Socket = ioClass({
 		resource: 'socket.io',
 		transports: ['websocket','xhr-polling'],
 //		transports: ['websocket', 'htmlfile', 'flashsocket', 'xhr-multipart', 'xhr-polling'],
-//		transports: ['xhr-polling'],
 		transportOptions: {},
 		rememberTransport: true
 	},
@@ -1230,7 +1234,9 @@ io.Socket = ioClass({
 			if (io.Transport[transport] 
 				&& io.Transport[transport].check() 
 				&& (!this._isXDomain() || io.Transport[transport].xdomainCheck())){
-				return new io.Transport[transport](this, this.options.transportOptions[transport] || {});
+				var transp = new io.Transport[transport](this, this.options.transportOptions[transport] || {});
+                transp.name = transport;
+                return transp;
 			}
 		}
 		return null;

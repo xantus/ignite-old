@@ -1,5 +1,16 @@
 #!/usr/bin/env perl
 
+use File::Basename 'dirname';
+use File::Spec;
+
+my $bin;
+BEGIN {
+    $bin = join( '/', File::Spec->splitdir(dirname(__FILE__)) );
+}
+
+use lib "$bin/../lib";
+use lib "$bin/../mojo/lib";
+
 # Copyright (C) 2008-2010, Sebastian Riedel.
 
 use strict;

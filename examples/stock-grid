@@ -1,0 +1,69 @@
+#!/usr/bin/perl
+
+use File::Basename 'dirname';
+use File::Spec;
+
+my $bin;
+BEGIN {
+    $bin = join( '/', File::Spec->splitdir(dirname(__FILE__)) );
+}
+
+use lib "$bin/../lib";
+use lib "$bin/../mojo/lib";
+
+use Mojolicious::Lite;
+use Ignite::Lite;
+
+# serve static files from here
+app->static->root( "$bin/../public" ); # if ran from examples
+
+# noisy log
+app->log->level( 'debug' );
+
+# auto daemon
+@ARGV = qw( daemon ) unless @ARGV;
+
+# the config will be auto created for you, if the config key or db isn't found
+# to edit your config visit: http://127.0.0.1:5984/_utils/document.html?ignite/config
+ignite->init( 'http://127.0.0.1:5984/ignite/config' );
+
+# current snapshot
+my $snapshot = {};
+
+ignite->subscribe( '/stocks', sub {
+    my ( $client, $event ) = @_;
+
+    foreach ( @{$event->{items}} ) {
+        $snapshot->{ $_->{name} } = $_;
+    }
+});
+
+# connection from browser to ignite opened
+socketio 'open' => sub {
+    my $client = shift;
+
+    $client->send_message({ channel => '/stocks', items => [ values %$snapshot ], total => scalar( keys %$snapshot ) });
+    $client->subscribe( '/stocks' );
+
+    $client->heartbeat( 200 );
+};
+
+# connection from browser to ignite closed
+socketio 'close' => sub {
+    my $client = shift;
+
+};
+
+# message sent from browser to ignite
+socketio 'message' => sub {
+    my ( $client, $data ) = @_;
+
+};
+
+get '/' => sub {
+    shift->redirect_to( '/stockgrid/index.html' );
+};
+
+print "go to http://localhost:3000/stockgrid/index.html\n";
+app->start;
+

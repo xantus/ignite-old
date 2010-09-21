@@ -8,8 +8,8 @@ BEGIN {
     $bin = join( '/', File::Spec->splitdir(dirname(__FILE__)) );
 }
 
-use lib "$bin/lib";
 use lib "$bin/../lib";
+use lib "$bin/../mojo/lib";
 
 use Mojolicious::Lite;
 use Ignite::Lite;
@@ -34,7 +34,6 @@ my $msgs = [];
 socketio 'open' => sub {
     my ( $client ) = @_;
 
-    $client->send_message({ sessionid => $client->id });
     $client->send_message({ buffer => $msgs });
 
     $client->broadcast({ announcement => $client->id . ' connected' });

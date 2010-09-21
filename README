@@ -1,4 +1,6 @@
-Ignite, the scalable Perl Socket.IO server
+Ignite, a scalable Perl based Socket.IO pubsub framework
+
+Copyright (c) 2010, David Davis - All rights reserved
 
 Requirements:
     Mojolicious (http://mojolicio.us/) (get the git version)
@@ -6,8 +8,3 @@ Requirements:
 
 License: MIT
 
-------------------------------------------------
-
-Currently in heavy development, don't expect it to work yet.
-
-The other transports are in the works

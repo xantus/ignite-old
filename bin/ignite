@@ -11,8 +11,8 @@ BEGIN {
     $bin = join( '/', File::Spec->splitdir(dirname(__FILE__)) );
 }
 
-use lib "$bin/lib";
 use lib "$bin/../lib";
+use lib "$bin/../mojo/lib";
 
 $ENV{MOJO_HOME} = "$bin/../";
 

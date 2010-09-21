@@ -1,0 +1,60 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+<title>Live Stock Grid</title>
+
+<link rel="stylesheet" type="text/css" href="../ext/resources/css/ext-all.css" />
+
+<!-- LIBS -->
+<script type="text/javascript" src="../ext/adapter/ext/ext-base.js"></script>
+<!-- ENDLIBS -->
+
+<script type="text/javascript" src="../ext/ext-all.js"></script>
+<script type="text/javascript" src="../ext/debug.js"></script>
+
+<script type="text/javascript">
+    // only load the flash fallback when needed
+    if ( !( 'WebSocket' in window ) ) {
+        document.write([
+            '<scr'+'ipt type="text/javascript" src="/client/lib/vendor/web-socket-js/swfobject.js"></scr'+'ipt>',
+            '<scr'+'ipt type="text/javascript" src="/client/lib/vendor/web-socket-js/FABridge.js"></scr'+'ipt>',
+            '<scr'+'ipt type="text/javascript" src="/client/lib/vendor/web-socket-js/web_socket.js"></scr'+'ipt>'
+        ].join(''));
+    }
+</script>
+
+<script src="/client/socket.io.js"></script>
+
+<script type="text/javascript" src="stockgrid.js"></script>
+<link rel="stylesheet" type="text/css" href="grid-examples.css" />
+
+<!-- Common Styles for the examples -->
+<link rel="stylesheet" type="text/css" href="../ext/examples/shared/examples.css" />
+</head>
+<body>
+<script type="text/javascript" src="../ext/examples/shared/examples.js"></script><!-- EXAMPLES -->
+<script type="text/javascript">
+    Ext.BLANK_IMAGE_URL = '../ext/resources/images/default/s.gif';
+</script>
+
+<script>
+    // http://gist.github.com/533107
+    document.write([
+        '<img src="http://chart.apis.google.com/chart?chs=150x150&cht=qr&choe=UTF-8&chld=L|1&chl=',
+        encodeURIComponent(window.location.href),
+        '" width="35" height="35" alt="QR Code" title="Click Me!" ',
+        'style="position:absolute;top:10px;right:10px;" ',
+        'onclick="this.width=this.height=(this.width==35)?150:35;"/>'
+    ].join(''));
+</script>
+
+<h1>Live Stock Grid</h1>
+<p>This is a live stock grid using fake data</p>
+<!-- p>Note that the js is not minified so it is readable. See <a href="paging.js">paging.js</a>.</p-->
+
+<div id="status"></div>
+<div id="live-grid"></div>
+
+</body>
+</html>

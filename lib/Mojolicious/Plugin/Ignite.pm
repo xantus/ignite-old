@@ -5,7 +5,8 @@ use warnings;
 
 use base 'Mojolicious::Plugin';
 
-__PACKAGE__->attr([qw/ couch_url /]);
+# pubsub_client is the the app participating in pubsub
+__PACKAGE__->attr([qw/ couch_url pubsub_client /]);
 
 use Ignite::Plugins;
 use MojoX::CouchDB;
@@ -20,8 +21,6 @@ our $VERSION = '1.00';
 my $clients;
 
 BEGIN {
-    Mojo::Client->singleton->ioloop( Mojo::IOLoop->singleton );
-    Mojo::Client->singleton->keep_alive_timeout(30);
     $clients = Ignite::Clients->singleton;
 };
 
@@ -61,11 +60,14 @@ sub init {
     # XXX detour?
     $app->routes->route( $base.'/websocket' )->websocket->to({ cb => sub { $self->_handle_websocket( @_ ); } });
     $app->routes->route( $base.'/xhr-polling' )->to({ cb => sub { $self->_handle_xhr_polling( @_ ); } });
-    $app->routes->route( $base.'/xhr-polling/:cid' )->to({ cb => sub { $self->_handle_xhr_polling( @_ ); } });
+    $app->routes->route( $base.'/xhr-polling/(*cid)' )->to({ cb => sub { $self->_handle_xhr_polling( @_ ); } });
     $app->routes->route( $base.'/xhr-polling/:cid/send' )->via( 'post' )->to({ cb => sub { $self->_handle_xhr_polling( @_ ); } });
 #    $app->routes->route( $base )->to({ cb => sub { $self->_dispatch( @_ ); } });
 
     $self->cfg->field( heartbeat => 5000 ) unless $self->cfg->field( 'heartbeat' );
+
+    Mojo::Client->singleton->ioloop( Mojo::IOLoop->singleton );
+    Mojo::Client->singleton->keep_alive_timeout(30);
 
     $clients->init( $self->db_name, $self->couch_url->clone );
 
@@ -76,12 +78,51 @@ sub publish {
     $clients->publish( @_[ 1 .. $#_ ] );
 }
 
-sub subscribe {
+sub subscribe_client {
     $clients->subscribe( @_[ 1 .. $#_ ] );
 }
 
-sub unsubscribe {
+sub unsubscribe_client {
     $clients->unsubscribe( @_[ 1 .. $#_ ] );
+}
+
+sub subscribe {
+    my ( $self, $ch, $cb ) = @_;
+
+    $self->plugins->add_hook( $ch => $cb );
+
+    if ( $self->pubsub_client ) {
+        $self->pubsub_client->subscribe( $ch );
+    } else {
+        # done this way for scope
+        my $client; $client = $clients->create(
+            # XXX disable this after debugging
+#            id => 'server',
+            transport => 'server',
+            is_persistent => 1,
+            event_cb => sub {
+                foreach ( @{$_[0]} ) {
+                    $self->plugins->run_hook( $ch, $client, $_ );
+                }
+            }
+        );
+        $self->pubsub_client( $client );
+        $client->subscribe( $ch );
+        $client->get_data;
+    }
+
+    return;
+}
+
+# XXX hmm
+sub unsubscribe {
+    my ( $self, $ch ) = @_;
+
+#    my $client = $clients->fetch( 'server' );
+#    $client = $clients->create( id => 'server', transport => 'server' ) unless $client;
+#    $client->unsubscribe( $ch );
+
+    return;
 }
 
 sub broadcast {
@@ -146,14 +187,31 @@ sub _check_install {
         $db->create unless @exists;
         $doc = $db->create_document( $config_key,
             base => '/socket.io',
+            db => 'events',
             mojo_config => {
                secret => sha1_hex( join('|', $self, time(), rand(100000) ) )
             }
         );
     }
 
-    $db_name = $doc->field( 'db' ) || $db_name;
+    # XXX delete all client databases on start, temporary
+    foreach ( $self->couch->all_databases ) {
+        $self->couch->raw_delete( $_->name ) if $_->name =~ m/^cli_/;
+        if ( $_->name =~ m/^ch_/ ) {
+            warn "recreating:".$_->name."\n";
+            my $name = $_->name; $name =~ s/\//%2f/g;
+            $self->couch->raw_delete( $name );
+            $self->couch->raw_put( $name );
+        }
+    }
+    $self->couch->raw_delete( 'clients' );
+    $self->couch->raw_put( 'clients' );
+
+    $db_name = $doc->field( 'db' ) || 'events';
     $self->db_name( $db_name );
+
+    $self->couch->raw_delete( $db_name );
+    $self->couch->raw_put( $db_name );
 
     $self->cfg( $doc );
 }
@@ -171,18 +229,21 @@ sub _setup_session {
 
     my $uid = $c->session( 'uid' );
     my $cid = $c->stash( 'cid' );
+    if ( $cid =~ s/\/$// ) {
+        $c->stash( cid => $cid );
+    }
 
     # session creation
     unless ( $uid ) {
         if ( $c->param( 'cookietest' ) ) {
-            $c->render_text( 'Cookies must be turned on' );
-            return;
+            $c->session( uid => $uid = sha1_hex( join( '|', $c, time(), rand(100000) ) ) );
+            # XXX error
+            #$c->render_text( 'Cookies must be turned on' );
+            return $uid;
         }
-        $uid = sha1_hex( join( '|', $c, time(), rand(100000) ) );
-        $c->session( uid => $uid );
-        $cid ||= sha1_hex( join( '|', $uid, time(), rand(100000) ) );
+        $c->session( uid => $uid = sha1_hex( join( '|', $c, time(), rand(100000) ) ) );
         my $base = $self->cfg->field('base') || '/socket.io';
-        $c->redirect_to( $base.'/xhr-polling/'.$cid.'?cookietest=1' );
+        $c->redirect_to( sprintf( '%s/%s/%s%s', $base, $c->stash( 'transport' ), ( $cid || '' ), '?cookietest=1'  ));
         return;
     }
 
@@ -194,7 +255,21 @@ sub _handle_websocket {
 
     return unless ( $c->tx->is_websocket );
 
-    warn "websocket @_\n";
+    $c->stash( transport => 'websocket' );
+
+    my $draft75 = $c->req->headers->header( 'Sec-WebSocket-Key1' ) ? 0 : 1;
+    $c->stash( draft75 => $draft75 );
+    $c->stash( draft76 => !$draft75 );
+
+#    if ( 0 && $draft75 ) {
+#        $c->res->code( 404 );
+#        foreach (qw( Upgrade Sec-WebSocket-Location Sec-WebSocket-Origin )) {
+#            $c->res->headers->remove( $_ );
+#        }
+#        $c->res->headers->header( 'Connection' => 'close' );
+#        $c->render_text('Draft 75 is old');
+#        return;
+#    }
 
     # XXX does websocket upgrade allow redirection?
     my $uid = $c->session( 'uid' );
@@ -203,30 +278,32 @@ sub _handle_websocket {
     }
 
     my $cid = $c->stash( 'cid' );
-    unless ( $cid ) {
-        $c->stash( cid => $cid = sha1_hex( join( '|', $uid, time(), rand(100000) ) ) );
+    if ( $cid && $cid =~ m/([a-fA-F0-9]{40})/ ) {
+        $c->stash( cid => $cid = lc $1 ) if $1 ne $cid;
     }
 
-    my $client = $clients->fetch_create( $c, $cid, 'websocket' );
+    my $client = $clients->fetch_create( $c, 'websocket' );
 
     $c->finished(sub {
         $self->plugins->run_hook( 'close', $client );
-        $clients->remove( $cid );
+        $clients->remove( $client->id );
     });
 
     $c->receive_message(sub {
         $self->plugins->run_hook( 'message', $client, ( $self->json->decode( $_[1] ) )->[0] );
     });
 
+    $client->send_message({ sessionid => $client->id, draft75 => $draft75 ? $self->json->true : $self->json->false });
     $self->plugins->run_hook( 'open', $client );
+    $client->get_data;
 
-    $client->get_data();
-
-    return
+    return;
 }
 
 sub _handle_xhr_polling {
     my ( $self, $c ) = @_;
+
+    $c->stash( transport => 'xhr-polling' );
 
     # XXX config deny xdomain?
     if ( $self->_origin_ok( $c ) ) {
@@ -239,28 +316,37 @@ sub _handle_xhr_polling {
     return unless my $uid = $self->_setup_session( $c );
 
     my $cid = $c->stash( 'cid' );
-    my $new;
-    unless ( $cid ) {
-        $c->stash( cid => $cid = sha1_hex( join( '|', $uid, time(), rand(100000) ) ) );
-        warn "new cid $cid\n";
-        $new = 1;
+    if ( $cid && $cid =~ m/([a-fA-F0-9]{40})/ ) {
+        $c->stash( cid => $cid = lc $1 ) if $1 ne $cid;
     }
 
-    my $client = $clients->fetch_create( $c, $cid, 'xhr-polling' );
+    unless ( $cid ) {
+        $c->flash( newclient => 1 );
+        $c->stash( newclient => 1 );
+    }
+
+    my $client = $clients->fetch_create( $c, 'xhr-polling' );
 
     # XXX doesn't seem to be called
     $c->finished(sub {
-        warn "client $cid finished\n";
-        $clients->remove( $cid );
+        my $id = $client->id;
+        warn "client $id finished\n";
+        $clients->remove( $id );
     });
 
     my $method = $c->req->method;
 
     if ( $method eq 'GET' ) {
-        $self->plugins->run_hook( 'open', $client ) if $new;
+        if ( $c->stash( 'newclient') ) {
+            $c->render_json({ messages => [{ sessionid => $client->id }] });
+            return;
+        }
+        if ( $c->flash( 'newclient' ) ) {
+            $self->plugins->run_hook( 'open', $client );
+        }
 
-        # get data if available, or wait 10s if none waiting
-        $client->get_data( 10 );
+        # get data if available, or wait
+        $client->get_data;
         return;
     } elsif ( $method eq 'POST' ) {
         if ( my $data = $c->req->param( 'data' ) ) {
@@ -277,11 +363,13 @@ sub _handle_xhr_polling {
                 }
             }
         }
-        $c->render_text('ok');
+        $c->render_data('{"ok":true}', type => 'application/json');
         return;
     }
 
-    $c->render_json({});
+    $c->render_json({ messages => [] });
+
+    return;
 }
 
 sub _origin_ok {
@@ -309,19 +397,21 @@ __END__
 
 =head1 NAME
 
-Mojolicious::Plugin::Ignite - Socket.io plugin for Mojolicious
+Mojolicious::Plugin::Ignite - PubSub plugin for Mojolicious
 
 =head1 SYNOPSIS
 
     # Mojolicious
-    $self->plugin( 'ignite' => [ 'http://127.0.0.1:5984/ignite' => 'config' ] );
+    my $plugin = $self->plugin( 'ignite' );
+    $plugin->init( 'http://127.0.0.1:5984/ignite' );
 
     # Mojolicious::Lite
-    plugin 'ignite' => [ 'http://127.0.0.1:5984/ignite' => 'config' ];
+    plugin 'ignite';
+    ignite->init( 'http://127.0.0.1:5984/ignite/config' );
 
 =head1 DESCRIPTION
 
-L<Mojolicous::Plugin::Ignite> is a socket.io server for Mojolicious
+L<Mojolicous::Plugin::Ignite> is a PubSub server using Socket.IO and Mojolicious
 
 =head1 METHODS
 

@@ -1,5 +1,16 @@
 #!/usr/bin/perl
 
+use File::Basename 'dirname';
+use File::Spec;
+
+my $bin;
+BEGIN {
+    $bin = join( '/', File::Spec->splitdir(dirname(__FILE__)) );
+}
+
+use lib "$bin/../lib";
+use lib "$bin/../mojo/lib";
+
 use Mojo::Client;
 use Data::Dumper;
 use JSON;
